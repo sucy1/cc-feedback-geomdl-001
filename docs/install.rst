@@ -1,0 +1,129 @@
+Installation and Testing
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+**Installation via pip is the recommended method for all users.**
+Manual method is only recommended for advanced users. Please note that if you have used any of these methods to install
+NURBS-Python, please use the same method to upgrade to the latest version.
+
+.. note::
+
+    On systems with more than one Python installed, ``python`` and ``pip`` may
+    point at an older interpreter. Check the version with ``python -V`` before installing.
+
+Install via Pip
+===============
+
+The easiest method to install/upgrade NURBS-Python is using `pip <https://pip.pypa.io/en/stable/>`_. The following
+commands will download and install NURBS-Python from `Python Package Index <https://pypi.org/project/geomdl>`_.
+
+.. code-block:: console
+
+    $ pip install --user geomdl
+
+Upgrading to the latest version:
+
+.. code-block:: console
+
+    $ pip install geomdl --upgrade
+
+Installing a specific version:
+
+.. code-block:: console
+
+    $ pip install --user geomdl==5.4.1
+
+Manual Install
+==============
+
+The initial step of the manual install is cloning the repository via ``git`` or downloading the ZIP archive from the
+`repository page <https://github.com/orbingol/NURBS-Python>`_ on GitHub. The package includes a *setup.py* script
+which will take care of the installation and automatically copy/link the required files to your Python distribution's
+*site-packages* directory.
+
+The most convenient method to install NURBS-Python manually is using ``pip``:
+
+.. code-block:: console
+
+    $ pip install --user .
+
+To upgrade, please pull the latest commits from the repository via ``git pull --rebase`` and then execute the above
+command.
+
+Development Mode
+================
+
+The following command enables development mode by creating a link from the directory where you cloned NURBS-Python
+repository to your Python distribution's *site-packages* directory:
+
+.. code-block:: console
+
+    $ pip install --user -e .
+
+Since this command only generates a link to the library directory, pulling the latest commits from the repository
+would be enough to update the library to the latest version.
+
+Checking Installation
+=====================
+
+If you would like to check if you have installed the package correctly, you may try to print ``geomdl.__version__``
+variable after import. The following example illustrates installation check on a Windows PowerShell instance::
+
+    Windows PowerShell
+    Copyright (C) Microsoft Corporation. All rights reserved.
+
+    PS C:\> python
+    Python 3.11.13 on win32
+    Type "help", "copyright", "credits" or "license" for more information.
+    >>> import geomdl
+    >>> geomdl.__version__
+    '4.0.2'
+    >>>
+
+Testing
+=======
+
+The package includes ``tests/`` directory which contains all the automated testing scripts.
+These scripts require `pytest <https://pytest.readthedocs.io/en/latest>`_ installed on your Python distribution.
+Then, you can execute the following from your favorite IDE or from the command line:
+
+.. code-block:: console
+
+    $ pytest
+
+pytest will automatically find the tests under ``tests/`` directory, execute them and show the results.
+
+Compile with Cython
+===================
+
+To improve performance, the :doc:`Core Library <modules>` of NURBS-Python can be compiled and installed using the
+following command along with the pure Python version.
+
+.. code-block:: console
+
+    $ SETUPTOOLS_USE_CYTHON=1 pip install --user .
+
+After the successful execution of the command, the you can import and use the compiled library as follows:
+
+.. code-block:: python
+    :linenos:
+
+    # Importing NURBS module
+    from geomdl.core import NURBS
+    # Importing visualization module
+    from geomdl.visualization import VisMPL as vis
+
+    # Creating a curve instance
+    crv = NURBS.Curve()
+
+    # Make a quadratic curve
+    crv.degree = 2
+
+    #######################################################
+    # Skipping control points and knot vector assignments #
+    #######################################################
+
+    # Set the visualization component and render the curve
+    crv.vis = vis.VisCurve3D()
+    crv.render()
+
+Before the Cython compilation, please make sure that you have a valid compiler installed for your operating system.

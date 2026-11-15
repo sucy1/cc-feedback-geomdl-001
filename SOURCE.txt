@@ -1,0 +1,5 @@
+来源仓库：https://github.com/orbingol/NURBS-Python
+冻结 commit：2d19713a5e097ae99fda38b02b9b35d58c2aeb13
+许可证：MIT
+导入日期：2026-11-15
+说明：本目录为评测底座，已剥离上游 git 历史，仅保留代码快照。
