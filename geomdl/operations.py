@@ -1751,3 +1751,373 @@ def flip(surf, **kwargs):
         g.set_ctrlpts(new_cpts, size_u, size_v)
 
     return geom
+
+
+def _pair_or_single(value, name):
+    """Normalizes an int-or-pair argument to a pair of ints."""
+    if isinstance(value, (list, tuple)):
+        if len(value) != 2:
+            raise GeomdlException(name + " must be a single integer or a pair of integers")
+        return int(value[0]), int(value[1])
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise GeomdlException(name + " must be a single integer or a pair of integers")
+    return int(value), int(value)
+
+
+def _surface_closed_directions(surface):
+    """Detects parametric directions whose first and last control point rows/columns coincide."""
+    size_u = surface.ctrlpts_size_u
+    size_v = surface.ctrlpts_size_v
+    cpts = surface.ctrlpts
+    scale = 1.0
+    for pt in cpts:
+        for c in pt:
+            if abs(c) > scale:
+                scale = abs(c)
+    tol = 1e-8 * scale
+    closed_u = all(
+        linalg.point_distance(cpts[j], cpts[(size_u - 1) * size_v + j]) <= tol for j in range(size_v)
+    )
+    closed_v = all(
+        linalg.point_distance(cpts[i * size_v], cpts[i * size_v + size_v - 1]) <= tol for i in range(size_u)
+    )
+    return closed_u, closed_v
+
+
+def _integration_grid(start, stop, num, closed):
+    """Generates 1-D integration nodes and weights.
+
+    Closed (periodic) directions use the periodic trapezoidal rule, which is spectrally accurate for
+    smooth periodic integrands. Open directions use the composite Simpson rule.
+    """
+    if closed:
+        h = (stop - start) / float(num)
+        params = [start + (i * h) for i in range(num)]
+        weights = [h for _ in range(num)]
+    else:
+        n = num if num % 2 == 1 else num + 1  # Simpson needs an even number of intervals
+        h = (stop - start) / float(n - 1)
+        params = [start + (i * h) for i in range(n)]
+        weights = []
+        for i in range(n):
+            if i == 0 or i == n - 1:
+                weights.append(h / 3.0)
+            elif i % 2 == 1:
+                weights.append(4.0 * h / 3.0)
+            else:
+                weights.append(2.0 * h / 3.0)
+    return params, weights
+
+
+@export
+def surface_area(surface, sample_size=30):
+    """Computes the surface area of the input surface via numerical integration.
+
+    The parametric domain is sampled on an equally-spaced grid and the magnitude of the cross product of
+    the partial derivatives, :math:`|\\partial S/\\partial u \\times \\partial S/\\partial v|`, is
+    integrated numerically. Open parametric directions use the composite Simpson rule; directions whose
+    first and last control points coincide (closed/periodic directions) use the periodic trapezoidal
+    rule, which has equivalent or better accuracy for smooth periodic integrands.
+
+    :param surface: input surface
+    :type surface: abstract.Surface
+    :param sample_size: number of sample points per direction; a single integer or a (u, v) pair
+    :type sample_size: int, list, tuple
+    :return: surface area
+    :rtype: float
+    """
+    if not isinstance(surface, abstract.Surface):
+        raise GeomdlException("Input geometry must be an instance of abstract.Surface")
+
+    size_u, size_v = _pair_or_single(sample_size, "sample_size")
+    if size_u < 2 or size_v < 2:
+        raise GeomdlException("sample_size must be at least 2 in each parametric direction")
+
+    if surface.dimension != 3:
+        raise GeomdlException("Surface area computation requires a 3-dimensional surface")
+
+    degree_u = surface.degree_u
+    degree_v = surface.degree_v
+    kv_u = surface.knotvector_u
+    kv_v = surface.knotvector_v
+    u_start, u_stop = kv_u[degree_u], kv_u[-(degree_u + 1)]
+    v_start, v_stop = kv_v[degree_v], kv_v[-(degree_v + 1)]
+
+    closed_u, closed_v = _surface_closed_directions(surface)
+    params_u, weights_u = _integration_grid(u_start, u_stop, size_u, closed_u)
+    params_v, weights_v = _integration_grid(v_start, v_stop, size_v, closed_v)
+
+    area = 0.0
+    for u, wu in zip(params_u, weights_u):
+        for v, wv in zip(params_v, weights_v):
+            skl = surface.derivatives(u, v, 1)
+            cross = linalg.vector_cross(skl[1][0], skl[0][1])
+            area += wu * wv * linalg.vector_magnitude(cross)
+
+    return float(area)
+
+
+def _basis_matrix_row(degree, knot_vector, num_ctrlpts, param):
+    """Computes the non-zero basis function entries for a single parameter.
+
+    Returns a list of (column_index, value) pairs.
+    """
+    span = helpers.find_span_linear(degree, knot_vector, num_ctrlpts, param)
+    basis = helpers.basis_function(degree, knot_vector, span, param)
+    return [(span - degree + r, val) for r, val in enumerate(basis)]
+
+
+def _least_squares_multi(matrix_a, matrix_b):
+    """Solves min ||A x - b|| for multiple right-hand sides (columns of b)."""
+    try:
+        import numpy
+
+        a_np = numpy.asarray(matrix_a, dtype=float)
+        b_np = numpy.asarray(matrix_b, dtype=float)
+        x_np, _, _, _ = numpy.linalg.lstsq(a_np, b_np, rcond=None)
+        return x_np.tolist()
+    except ImportError:
+        # Fall back to normal equations solved with the bundled LU routines
+        mat_at = linalg.matrix_transpose(matrix_a)
+        mat_ata = linalg.matrix_multiply(mat_at, matrix_a)
+        mat_atb = linalg.matrix_multiply(mat_at, matrix_b)
+        mat_l, mat_u = linalg.lu_decomposition(mat_ata)
+        num_rhs = len(mat_atb[0])
+        x = [[0.0 for _ in range(num_rhs)] for _ in range(len(mat_ata))]
+        for c in range(num_rhs):
+            bcol = [row[c] for row in mat_atb]
+            y = linalg.forward_substitution(mat_l, bcol)
+            xcol = linalg.backward_substitution(mat_u, y)
+            for r in range(len(mat_ata)):
+                x[r][c] = xcol[r]
+        return x
+
+
+def _fit_surface_least_squares(params_u, params_v, points, dim, degree_u, degree_v, num_cpts_u, num_cpts_v):
+    """Fits a B-spline surface to a regular grid of data points via least squares.
+
+    Fits all rows along the u-direction first, then all rows along the v-direction. Returns the control
+    points grid (v-fastest ordering) along with the knot vectors computed by the averaging algorithm
+    (Eqns. 9.68 and 9.69 of The NURBS Book).
+    """
+    from . import fitting
+
+    size_u = len(params_u)
+    size_v = len(params_v)
+
+    # Knot vectors from the sample parameters (data-dependent, clamped at both ends)
+    kv_u = fitting.compute_knot_vector2(degree_u, size_u, num_cpts_u, params_u)
+    kv_v = fitting.compute_knot_vector2(degree_v, size_v, num_cpts_v, params_v)
+
+    # Basis matrices
+    mat_u = [[0.0 for _ in range(num_cpts_u)] for _ in range(size_u)]
+    for i, u in enumerate(params_u):
+        for col, val in _basis_matrix_row(degree_u, kv_u, num_cpts_u, u):
+            mat_u[i][col] = val
+    mat_v = [[0.0 for _ in range(num_cpts_v)] for _ in range(size_v)]
+    for j, v in enumerate(params_v):
+        for col, val in _basis_matrix_row(degree_v, kv_v, num_cpts_v, v):
+            mat_v[j][col] = val
+
+    # Pass 1: fit along u for all (v, dim) columns at once
+    rhs_u = [[points[i * size_v + j][d] for j in range(size_v) for d in range(dim)] for i in range(size_u)]
+    sol_u = _least_squares_multi(mat_u, rhs_u)  # num_cpts_u x (size_v * dim)
+
+    # Pass 2: fit along v for all (u, dim) columns at once
+    rhs_v = [[sol_u[i][j * dim + d] for i in range(num_cpts_u) for d in range(dim)] for j in range(size_v)]
+    sol_v = _least_squares_multi(mat_v, rhs_v)  # num_cpts_v x (num_cpts_u * dim)
+
+    ctrlpts = [[sol_v[j][i * dim + d] for d in range(dim)] for i in range(num_cpts_u) for j in range(num_cpts_v)]
+    return ctrlpts, kv_u, kv_v
+
+
+@export
+def offset_surface(surface, distance, *, sample_size=None, degree=None, num_ctrlpts=None, max_iter=20):
+    """Offsets a surface along its unit normal vectors and returns the offset as a B-spline surface.
+
+    The source surface is sampled on a regular grid, each sample point is translated by ``distance``
+    along the unit surface normal at that point, and a B-spline surface is fitted to the translated
+    points via least squares. The knot vectors of the fitted surface are computed from the sample
+    parameters using the averaging algorithm (Eqns. 9.68 and 9.69 of The NURBS Book), so they are
+    clamped (end knot multiplicity equals ``degree + 1``) and data-dependent rather than uniform.
+
+    If the offset distance exceeds the local radius of curvature at any sample point (i.e. the Jacobian
+    of the offset map changes sign and the offset surface would self-intersect), a
+    :class:`GeomdlException` is raised.
+
+    Keyword Arguments:
+        * ``sample_size``: number of sample points per direction; single int or (u, v) pair
+        * ``degree``: degree of the offset surface; single int or (du, dv) pair. *Default: source degree*
+        * ``num_ctrlpts``: control points grid size; single int or (nu, nv) pair. *Default: source size*
+        * ``max_iter``: maximum number of fit refinement iterations. *Default: 20*
+
+    :param surface: input surface
+    :type surface: abstract.Surface
+    :param distance: offset distance (negative values offset against the normal direction)
+    :type distance: float
+    :return: offset surface
+    :rtype: BSpline.Surface
+    """
+    from . import BSpline
+
+    if not isinstance(surface, abstract.Surface):
+        raise GeomdlException("Input geometry must be an instance of abstract.Surface")
+
+    if surface.rational:
+        raise GeomdlException("rational offset not supported: input surface is rational (NURBS)")
+
+    if surface.dimension != 3:
+        raise GeomdlException("Surface offsetting requires a 3-dimensional surface")
+
+    if isinstance(distance, bool) or not isinstance(distance, (int, float)):
+        raise GeomdlException("Offset distance must be a real number")
+    distance = float(distance)
+
+    # Degrees of the offset surface
+    if degree is None:
+        degree_u, degree_v = surface.degree_u, surface.degree_v
+    else:
+        degree_u, degree_v = _pair_or_single(degree, "degree")
+    if degree_u < 1 or degree_v < 1:
+        raise GeomdlException("degree must be at least 1 in each parametric direction")
+
+    # Control points grid size of the offset surface
+    if num_ctrlpts is None:
+        num_cpts_u, num_cpts_v = surface.ctrlpts_size_u, surface.ctrlpts_size_v
+    else:
+        num_cpts_u, num_cpts_v = _pair_or_single(num_ctrlpts, "num_ctrlpts")
+    if num_cpts_u < degree_u + 1 or num_cpts_v < degree_v + 1:
+        raise GeomdlException("num_ctrlpts must be at least degree + 1 in each parametric direction")
+
+    # Sample grid size
+    if sample_size is None:
+        size_u = max(2 * num_cpts_u, num_cpts_u + 5)
+        size_v = max(2 * num_cpts_v, num_cpts_v + 5)
+    else:
+        size_u, size_v = _pair_or_single(sample_size, "sample_size")
+    if size_u < 1 or size_v < 1:
+        raise GeomdlException("sample_size must be a positive integer in each parametric direction")
+    if size_u < num_cpts_u or size_v < num_cpts_v:
+        raise GeomdlException("sample_size must be greater than or equal to num_ctrlpts")
+
+    if max_iter < 1:
+        raise GeomdlException("max_iter must be a positive integer")
+
+    dim = surface.dimension
+    src_degree_u = surface.degree_u
+    src_degree_v = surface.degree_v
+    src_kv_u = surface.knotvector_u
+    src_kv_v = surface.knotvector_v
+    u_start, u_stop = src_kv_u[src_degree_u], src_kv_u[-(src_degree_u + 1)]
+    v_start, v_stop = src_kv_v[src_degree_v], src_kv_v[-(src_degree_v + 1)]
+
+    closed_u, closed_v = _surface_closed_directions(surface)
+
+    def sample_params(start, stop, num, closed):
+        # Closed directions must not be stitched by repeating the seam parameter: sample the periodic
+        # domain half-open and restore closure on the control points grid after the fit.
+        if closed:
+            h = (stop - start) / float(num)
+            return [start + (i * h) for i in range(num)]
+        return [start + (stop - start) * i / float(num - 1) for i in range(num)] if num > 1 else [start]
+
+    def sample_offset_points(params_u, params_v):
+        """Evaluates offset target points and checks the local curvature radius limit."""
+        targets = []
+        for u in params_u:
+            for v in params_v:
+                skl = surface.derivatives(u, v, 2)
+                pt = skl[0][0]
+                vec_u = skl[1][0]
+                vec_v = skl[0][1]
+                normal = linalg.vector_normalize(linalg.vector_cross(vec_u, vec_v))
+
+                # First and second fundamental forms
+                ffe = linalg.vector_dot(vec_u, vec_u)
+                fff = linalg.vector_dot(vec_u, vec_v)
+                ffg = linalg.vector_dot(vec_v, vec_v)
+                sfl = linalg.vector_dot(skl[2][0], normal)
+                sfm = linalg.vector_dot(skl[1][1], normal)
+                sfn = linalg.vector_dot(skl[0][2], normal)
+                det = (ffe * ffg) - (fff * fff)
+                if det > 0.0:
+                    mean_curv = ((ffe * sfn) - (2.0 * fff * sfm) + (ffg * sfl)) / (2.0 * det)
+                    gauss_curv = ((sfl * sfn) - (sfm * sfm)) / det
+                    disc = max(0.0, (mean_curv * mean_curv) - gauss_curv)
+                    root = math.sqrt(disc)
+                    for k in (mean_curv + root, mean_curv - root):
+                        # Jacobian scale factor of the offset map along this principal direction
+                        if 1.0 - (distance * k) <= 1e-12:
+                            raise GeomdlException(
+                                "offset exceeds local curvature radius at (u, v) = ("
+                                + str(u)
+                                + ", "
+                                + str(v)
+                                + "): the offset surface would self-intersect"
+                            )
+                targets.append([pt[d] + (distance * normal[d]) for d in range(dim)])
+        return targets
+
+    tol = 1e-5
+    best = None
+    best_err = float("inf")
+    prev_err = float("inf")
+    cur_size_u, cur_size_v = size_u, size_v
+    # Bound the refinement cost: the sample grid may grow at most 4x per direction
+    max_size_u = max(4 * size_u, 64)
+    max_size_v = max(4 * size_v, 64)
+    for _ in range(max_iter):
+        params_u = sample_params(u_start, u_stop, cur_size_u, closed_u)
+        params_v = sample_params(v_start, v_stop, cur_size_v, closed_v)
+
+        targets = sample_offset_points(params_u, params_v)
+
+        # Normalize sample parameters to [0, 1] for the fit
+        norm_u = [(u - u_start) / (u_stop - u_start) for u in params_u]
+        norm_v = [(v - v_start) / (v_stop - v_start) for v in params_v]
+
+        ctrlpts, kv_u, kv_v = _fit_surface_least_squares(
+            norm_u, norm_v, targets, dim, degree_u, degree_v, num_cpts_u, num_cpts_v
+        )
+
+        # Restore closure on the control points grid (never by duplicating sample parameters)
+        if closed_u:
+            for j in range(num_cpts_v):
+                ctrlpts[(num_cpts_u - 1) * num_cpts_v + j] = list(ctrlpts[j])
+        if closed_v:
+            for i in range(num_cpts_u):
+                ctrlpts[i * num_cpts_v + num_cpts_v - 1] = list(ctrlpts[i * num_cpts_v])
+
+        # Build the candidate surface
+        surf = BSpline.Surface()
+        surf.degree_u = degree_u
+        surf.degree_v = degree_v
+        surf.ctrlpts_size_u = num_cpts_u
+        surf.ctrlpts_size_v = num_cpts_v
+        surf.ctrlpts = ctrlpts
+        surf.knotvector_u = kv_u
+        surf.knotvector_v = kv_v
+
+        # Residual of the fit at the sampled parameters
+        err = 0.0
+        for idx, u in enumerate(norm_u):
+            for jdx, v in enumerate(norm_v):
+                fit_pt = surf.evaluate_single((u, v))
+                err = max(err, linalg.point_distance(fit_pt, targets[idx * len(norm_v) + jdx]))
+        if err < best_err:
+            best = surf
+            best_err = err
+        if err <= tol:
+            break
+
+        # Stop refining when the residual no longer improves meaningfully (the control net size bounds
+        # the achievable accuracy) or when the sample grid cap has been reached
+        if err > 0.5 * prev_err or (cur_size_u >= max_size_u and cur_size_v >= max_size_v):
+            break
+        prev_err = err
+
+        # Refine the sample grid and refit
+        cur_size_u = min(max_size_u, cur_size_u + max(2, cur_size_u // 2))
+        cur_size_v = min(max_size_v, cur_size_v + max(2, cur_size_v // 2))
+
+    return best
